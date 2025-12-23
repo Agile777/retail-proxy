@@ -1,6 +1,17 @@
-console.error('This folder is deprecated.');
-console.error('Use the repo-root server.js for local + Render deployments.');
-process.exit(1);
+import express from 'express';
+import cors from 'cors';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 
 function loadLocalSecrets(){
   try {
@@ -202,23 +213,41 @@ app.post('/api/mie', async (req, res) => {
   }
 });
 
-// SMS Portal API Proxy - Updated with new credentials and endpoints
-app.all('/api/sms/*', async (req, res) => {
+function getSmsCredentials() {
+  const secrets = loadLocalSecrets();
+  const clientId = process.env.SMS_CLIENT_ID || secrets?.SMS_CLIENT_ID || secrets?.sms_client_id || null;
+  const clientSecret = process.env.SMS_CLIENT_SECRET || secrets?.SMS_CLIENT_SECRET || secrets?.sms_client_secret || null;
+  return { clientId, clientSecret };
+}
+
+function formatSmsPortalNumber(phone) {
+  if (!phone) return '';
+  let cleaned = String(phone).replace(/\D/g, '');
+  if (!cleaned) return '';
+  // Normalize to 27XXXXXXXXX (no +)
+  if (cleaned.startsWith('27')) return cleaned;
+  if (cleaned.startsWith('0')) return `27${cleaned.slice(1)}`;
+  if (cleaned.length === 9) return `27${cleaned}`;
+  return cleaned;
+}
+
+async function forwardSms(req, res, smsPathOverride = null) {
   try {
-    const secrets = loadLocalSecrets();
-    const clientId = process.env.SMS_CLIENT_ID || secrets?.SMS_CLIENT_ID || 'b0839bcb-89e2-4592-8cf8-3a265c1cc82f';
-    const clientSecret = process.env.SMS_CLIENT_SECRET || secrets?.SMS_CLIENT_SECRET || '3OVb1yFZdskv/YJfHZW1VBeQjH4yzfpC';
+    const { clientId, clientSecret } = getSmsCredentials();
 
     if (!clientId || !clientSecret) {
       return res.status(400).json({
         ok: false,
-        error: 'Missing SMS credentials'
+        error: 'Missing SMS credentials',
+        hint: 'Set SMS_CLIENT_ID and SMS_CLIENT_SECRET as Render environment variables (or secrets.local.json for local dev).'
       });
     }
 
-    // Extract the path after /api/sms/
-    const smsPath = req.url.replace('/api/sms', '');
-    const smsUrl = `https://rest.smsportal.com${smsPath}`;
+    // Extract the path after /api/sms
+    const smsPath = smsPathOverride !== null
+      ? smsPathOverride
+      : req.url.replace('/api/sms', '');
+    const smsUrl = `https://rest.smsportal.com${smsPath || ''}`;
 
     console.log('SMS Proxy Request:', {
       method: req.method,
@@ -259,10 +288,70 @@ app.all('/api/sms/*', async (req, res) => {
       stack: err?.stack 
     });
   }
+}
+
+// Friendly endpoints used by the front-end
+app.post('/api/sms/send', async (req, res) => {
+  try {
+    const { message, recipients, options = {} } = req.body || {};
+    if (!message || !String(message).trim()) {
+      return res.status(400).json({ success: false, error: 'Message cannot be empty' });
+    }
+    if (!Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ success: false, error: 'No recipients specified' });
+    }
+
+    const messages = recipients.map(r => {
+      const raw = (r && typeof r === 'object') ? (r.cellphone_number || r.phone || r.contact_number || r.mobile) : r;
+      const destination = formatSmsPortalNumber(raw);
+      return {
+        content: String(message).trim(),
+        destination,
+        ...(options.scheduledFor ? { sendTime: options.scheduledFor } : {}),
+        ...(options.reference ? { reference: options.reference } : {})
+      };
+    }).filter(m => m.destination);
+
+    if (!messages.length) {
+      return res.status(400).json({ success: false, error: 'No valid recipient numbers found' });
+    }
+
+    // SMS Portal bulk send
+    const payload = {
+      messages,
+      testMode: !!options.testMode,
+      ...(options.senderId ? { senderId: options.senderId } : {})
+    };
+
+    // Forward to the vendor endpoint
+    // Note: SMSPortal uses /BulkMessages for bulk sends.
+    const reqClone = {
+      ...req,
+      method: 'POST',
+      body: payload
+    };
+    const forwardRes = await (async () => {
+      // reuse the forwarding logic but override the path
+      return forwardSms(reqClone, res, '/BulkMessages');
+    })();
+    return forwardRes;
+  } catch (err) {
+    console.error('SMS send error:', err);
+    return res.status(500).json({ success: false, error: err?.message || String(err), type: 'proxy_error' });
+  }
 });
 
-// Listen on 0.0.0.0 for Render.com compatibility
-const host = process.env.RENDER ? '0.0.0.0' : '127.0.0.1';
+app.get('/api/sms/test', async (req, res) => {
+  // Simple connectivity check used by sms-api.js
+  return forwardSms(req, res, '/v1/Balance');
+});
+
+// Generic forwarders (supports /api/sms and /api/sms/*)
+app.all('/api/sms', (req, res) => forwardSms(req, res));
+app.all('/api/sms/*', (req, res) => forwardSms(req, res));
+
+// Listen on 0.0.0.0 for Render.com compatibility (safe for local too)
+const host = '0.0.0.0';
 app.listen(PORT, host, () => {
   console.log(`[rs-local-proxy] listening on http://${host}:${PORT}`);
   console.log(`[rs-local-proxy] health: http://${host}:${PORT}/health`);
